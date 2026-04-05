@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "Flit — Grocery Price Comparison",
+  "short_name": "Flit",
+  "version": "2.0.0",
+  "description": "Compare grocery prices across Blinkit, Zepto, Instamart, BigBasket & JioMart instantly.",
+
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "action": {
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Flit — Price Comparison"
+  },
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "permissions": [
+    "storage",
+    "cookies",
+    "scripting",
+    "tabs"
+  ],
+
+  "host_permissions": [
+    "https://api.blinkit.com/*",
+    "https://blinkit.com/*",
+    "https://api.zeptonow.com/*",
+    "https://www.zeptonow.com/*",
+    "https://api.swiggy.com/*",
+    "https://www.swiggy.com/*",
+    "https://www.bigbasket.com/*",
+    "https://clientapi.bigbasket.com/*",
+    "https://www.jiomart.com/*",
+    "http://localhost:5173/*",
+    "http://localhost:3001/*"
+  ],
+
+  "externally_connectable": {
+    "matches": [
+      "http://localhost:5173/*",
+      "http://localhost:3001/*"
+    ]
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://blinkit.com/*",
+        "https://www.zeptonow.com/*",
+        "https://www.swiggy.com/*",
+        "https://www.bigbasket.com/*",
+        "https://www.jiomart.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*.png"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
