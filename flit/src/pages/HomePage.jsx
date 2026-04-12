@@ -1,7 +1,7 @@
 import { useNavigate } from 'react-router-dom';
 import { MapPin, Link2, Clock } from 'lucide-react';
 import SearchBar       from '../components/SearchBar.jsx';
-import ExtensionBanner from '../components/ExtensionBanner.jsx';
+import ConnectBanner   from '../components/ConnectBanner.jsx';
 import { useUser }     from '../hooks/useUser.js';
 import { useLocation } from '../hooks/useLocation.js';
 import { PLATFORMS, PLATFORM_IDS } from '../data/platforms.js';
@@ -38,9 +38,9 @@ export default function HomePage() {
           </p>
         </div>
 
-        {/* Extension banner if not installed */}
+        {/* App connect banner */}
         <div className="w-full">
-          <ExtensionBanner />
+          <ConnectBanner />
         </div>
 
         {/* Search bar */}

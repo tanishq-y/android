@@ -1,21 +1,21 @@
-import { AlertTriangle, WifiOff, PackageSearch, PuzzleIcon, RefreshCw } from 'lucide-react';
+import { AlertTriangle, WifiOff, PackageSearch, Link2, RefreshCw } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 const CONFIGS = {
-  extension_missing: {
-    Icon:    PuzzleIcon,
-    color:   '#8025FB',
-    title:   'Flit extension not installed',
-    body:    'Flit searches directly from your browser using your real accounts — no bot detection, no blocked results. Install the extension to get started.',
+  connection_required: {
+    Icon:    Link2,
+    color:   '#0D9F6F',
+    title:   'Connect your quick-commerce accounts',
+    body:    'Flit needs at least one connected platform session to run user-context search. Open Connect and add Blinkit, Zepto, or Instamart.',
     actions: [
       {
-        label:   'Install Chrome Extension',
-        href:    'https://chrome.google.com/webstore/detail/flit',
+        label:   'Open connect flow',
+        href:    '/connect',
         primary: true,
       },
       {
-        label:   'Learn why this is needed',
-        href:    'https://github.com/flit-app/flit#how-it-works',
+        label:   'Read app flow notes',
+        href:    'https://github.com/flit-app/flit#session-vault-flow',
         primary: false,
       },
     ],
@@ -108,10 +108,10 @@ export default function ErrorState({ type = 'generic', message, onRetry }) {
         </button>
       )}
 
-      {/* Extension install: also show connect page link */}
-      {type === 'extension_missing' && (
+      {/* Account connection hint */}
+      {type === 'connection_required' && (
         <p className="text-[12px] text-gray-400 mt-4">
-          Already installed?{' '}
+          Already connected?{' '}
           <Link to="/connect" className="text-[#0D9F6F] font-medium hover:underline">
             Check your connection status →
           </Link>

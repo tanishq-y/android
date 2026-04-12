@@ -9,7 +9,7 @@ import Header       from './components/Header.jsx';
 import HomePage     from './pages/HomePage.jsx';
 import ResultsPage  from './pages/ResultsPage.jsx';
 import CartPage     from './pages/CartPage.jsx';
-import ConnectPage  from './pages/ConnectPage.jsx';
+import ConnectPage  from './pages/ConnectPageV2.jsx';
 import LocationPage from './pages/LocationPage.jsx';
 
 function AnimatedRoutes() {

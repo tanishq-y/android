@@ -1,5 +1,5 @@
 // Frontend normalise utilities — sorting, filtering, finding best deal.
-// Products arriving from the extension are already normalised to the standard schema.
+// Products arriving from server search are already normalised to the standard schema.
 
 export function sortByUnitPrice(products) {
   return [...products].sort((a, b) => {

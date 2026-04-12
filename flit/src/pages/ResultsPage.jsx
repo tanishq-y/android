@@ -37,7 +37,7 @@ export default function ResultsPage() {
   const query                       = searchParams.get('q') ?? '';
 
   const { state: loc }              = useLocation();
-  const { dispatch: userDispatch }  = useUser();
+  const { state: user, dispatch: userDispatch } = useUser();
   const { toasts, showToast, dismissToast } = useToast();
 
   const {
@@ -46,9 +46,9 @@ export default function ResultsPage() {
     loading,
     resolved,
     totalPlatforms,
-    extensionMissing,
+    fallbackUsed,
     refetch,
-  } = useSearch(query, loc);
+  } = useSearch(query, loc, user.connectedPlatforms);
 
   // Local UI state
   const [sort,             setSort]             = useState('unit_price');
@@ -95,22 +95,7 @@ export default function ResultsPage() {
     return null;
   }
 
-  if (extensionMissing) {
-    return (
-      <main className="bg-[#F7F8FA] min-h-screen">
-        <div className="max-w-[640px] mx-auto px-4 py-6">
-          <div className="mb-4"><SearchBar initialValue={query} /></div>
-          <ErrorState
-            type="extension_missing"
-            onRetry={refetch}
-          />
-        </div>
-      </main>
-    );
-  }
-
   const allFailed = !loading && resolved === totalPlatforms && results.length === 0;
-  const noResults = !loading && resolved === totalPlatforms && results.length === 0 && !allFailed;
 
   return (
     <main className="bg-[#F7F8FA] min-h-screen pb-20">
@@ -163,6 +148,13 @@ export default function ResultsPage() {
         {/* Main results */}
         {results.length > 0 && (
           <>
+            {fallbackUsed && (
+              <div className="mb-3 rounded-[10px] border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800">
+                Showing sample fallback results because live platform APIs did not return data for this query.
+                Reconnect your accounts in Connect and retry to compare real app prices.
+              </div>
+            )}
+
             {/* Best Deal Banner */}
             {bestDeal && (
               <BestDealBanner product={bestDeal} allProducts={processed} />

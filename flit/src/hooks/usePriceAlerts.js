@@ -1,4 +1,5 @@
 import { useUser } from './useUser.js';
+import { apiUrl } from '../utils/apiUrl';
 
 export function usePriceAlerts() {
   const { state, dispatch } = useUser();
@@ -29,7 +30,7 @@ export function usePriceAlerts() {
   async function checkAlerts(currentPrices) {
     if (!state.priceAlerts.length) return [];
     try {
-      const res  = await fetch('/api/alerts/check', {
+      const res  = await fetch(apiUrl('/api/alerts/check'), {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ prices: currentPrices }),

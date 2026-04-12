@@ -3,7 +3,6 @@ import { createContext, useReducer, useEffect } from 'react';
 export const UserContext = createContext(null);
 
 const INITIAL_STATE = {
-  extensionInstalled:  false,   // set by useExtension hook on mount
   connectedPlatforms:  [],      // platforms where user is logged in (from GET_STATUS)
   priceAlerts:         [],      // [{ productId, productName, platform, currentPrice, alertBelow, createdAt }]
   recentSearches:      [],      // string[] max 10
@@ -11,10 +10,6 @@ const INITIAL_STATE = {
 
 function userReducer(state, action) {
   switch (action.type) {
-
-    case 'SET_EXTENSION_INSTALLED':
-      return { ...state, extensionInstalled: action.payload };
-
     case 'SET_PLATFORM_STATUS':
       // payload: { blinkit: 'logged_in'|'logged_out'|'unknown'|true|false, ... }
       return {
