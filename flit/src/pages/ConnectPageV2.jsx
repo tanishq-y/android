@@ -11,6 +11,8 @@ import {
 
 import { useUser } from '../hooks/useUser.js';
 import { useBlinkitConnection } from '../hooks/useBlinkitConnection.js';
+import { useBigbasketConnection } from '../hooks/useBigbasketConnection.js';
+import { useJioMartConnection } from '../hooks/useJioMartConnection.js';
 import { useZeptoConnection } from '../hooks/useZeptoConnection.js';
 import { useInstamartConnection } from '../hooks/useInstamartConnection.js';
 import {
@@ -50,6 +52,22 @@ const APP_PLATFORMS = [
     iconBg: '#FFF7ED',
     description: 'Use your Instamart session for user-context search.',
   },
+  {
+    id: 'bigbasket',
+    title: 'BigBasket',
+    loginUrl: 'https://www.bigbasket.com',
+    accent: '#84C225',
+    iconBg: '#F1F8E9',
+    description: 'Capture richer session data for BigBasket verification and search.',
+  },
+  {
+    id: 'jiomart',
+    title: 'JioMart',
+    loginUrl: 'https://www.jiomart.com',
+    accent: '#0089CF',
+    iconBg: '#E0F2FE',
+    description: 'Capture richer session data for JioMart verification and search.',
+  },
 ];
 
 function getStatusTone({ loading, connected, reconnectRequired }) {
@@ -74,17 +92,23 @@ export default function ConnectPageV2() {
   const { dispatch } = useUser();
 
   const blinkitModel = useBlinkitConnection();
+  const bigbasketModel = useBigbasketConnection();
+  const jiomartModel = useJioMartConnection();
   const zeptoModel = useZeptoConnection();
   const instamartModel = useInstamartConnection();
 
   const platformModels = {
     blinkit: blinkitModel,
+    bigbasket: bigbasketModel,
+    jiomart: jiomartModel,
     zepto: zeptoModel,
     instamart: instamartModel,
   };
 
   const [cookieDrafts, setCookieDrafts] = useState({
     blinkit: '',
+    bigbasket: '',
+    jiomart: '',
     zepto: '',
     instamart: '',
   });
@@ -92,6 +116,7 @@ export default function ConnectPageV2() {
   const [errors, setErrors] = useState({});
   const [disconnectBusy, setDisconnectBusy] = useState({});
   const [captureBusy, setCaptureBusy] = useState({});
+  const [verifyBusy, setVerifyBusy] = useState({});
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [nativeBridgeReady, setNativeBridgeReady] = useState(() => isNativeAppBridgeAvailable());
   const [apiBaseDraft, setApiBaseDraft] = useState(() => getStoredApiBaseUrl() || getApiBaseUrl());
@@ -121,14 +146,16 @@ export default function ConnectPageV2() {
         blinkit: blinkitModel.connection.status === 'connected' ? 'logged_in' : 'logged_out',
         zepto: zeptoModel.connection.status === 'connected' ? 'logged_in' : 'logged_out',
         instamart: instamartModel.connection.status === 'connected' ? 'logged_in' : 'logged_out',
-        bigbasket: 'logged_out',
-        jiomart: 'logged_out',
+        bigbasket: bigbasketModel.connection.status === 'connected' ? 'logged_in' : 'logged_out',
+        jiomart: jiomartModel.connection.status === 'connected' ? 'logged_in' : 'logged_out',
       },
     });
   }, [
+    bigbasketModel.connection.status,
     blinkitModel.connection.status,
     dispatch,
     instamartModel.connection.status,
+    jiomartModel.connection.status,
     zeptoModel.connection.status,
   ]);
 
@@ -190,6 +217,8 @@ export default function ConnectPageV2() {
     setRefreshingAll(true);
     await Promise.all([
       blinkitModel.refresh().catch(() => {}),
+      bigbasketModel.refresh().catch(() => {}),
+      jiomartModel.refresh().catch(() => {}),
       zeptoModel.refresh().catch(() => {}),
       instamartModel.refresh().catch(() => {}),
     ]);
@@ -227,12 +256,25 @@ export default function ConnectPageV2() {
 
     try {
       const session = await exportPlatformSessionFromApp(platformId);
-      await saveSession(session);
+      const response = await saveSession(session);
       setCookieDrafts((prev) => ({ ...prev, [platformId]: session.cookieHeader }));
+
+      const headerCount = Number(response?.diagnostics?.headerCount ?? 0);
+      const missing = Array.isArray(response?.diagnostics?.missingRequiredHeaders)
+        ? response.diagnostics.missingRequiredHeaders
+        : [];
+
       setMessages((prev) => ({
         ...prev,
-        [platformId]: 'Session captured from app runtime and stored in Flit vault.',
+        [platformId]: `Session captured from app runtime and stored in Flit vault (captured headers: ${headerCount}).`,
       }));
+
+      if (missing.length > 0) {
+        setErrors((prev) => ({
+          ...prev,
+          [platformId]: `Captured session is missing required headers: ${missing.join(', ')}. Reopen login and navigate/search once before Capture session.`,
+        }));
+      }
     } catch (err) {
       setErrors((prev) => ({
         ...prev,
@@ -254,11 +296,22 @@ export default function ConnectPageV2() {
     }
 
     try {
-      await saveSession({ cookieHeader, expiresAt: null });
+      const response = await saveSession({ cookieHeader, expiresAt: null });
+      const missing = Array.isArray(response?.diagnostics?.missingRequiredHeaders)
+        ? response.diagnostics.missingRequiredHeaders
+        : [];
+
       setMessages((prev) => ({
         ...prev,
         [platformId]: 'Session saved to backend token vault.',
       }));
+
+      if (missing.length > 0) {
+        setErrors((prev) => ({
+          ...prev,
+          [platformId]: `Manual cookie save is missing required headers: ${missing.join(', ')}. Use app capture for a richer session.`,
+        }));
+      }
     } catch (err) {
       setErrors((prev) => ({
         ...prev,
@@ -285,6 +338,42 @@ export default function ConnectPageV2() {
       }));
     } finally {
       setDisconnectBusy((prev) => ({ ...prev, [platformId]: false }));
+    }
+  }
+
+  async function handleVerify(platformId, verify) {
+    clearFeedback(platformId);
+    setVerifyBusy((prev) => ({ ...prev, [platformId]: true }));
+    applyDraftApiBaseOverride();
+
+    try {
+      const result = await verify();
+
+      if (result?.valid === true) {
+        setMessages((prev) => ({
+          ...prev,
+          [platformId]: 'Session verified successfully.',
+        }));
+      } else {
+        const missing = Array.isArray(result?.diagnostics?.missingRequiredHeaders)
+          ? result.diagnostics.missingRequiredHeaders
+          : [];
+        const details = missing.length > 0
+          ? ` Missing headers: ${missing.join(', ')}`
+          : '';
+
+        setErrors((prev) => ({
+          ...prev,
+          [platformId]: `Verify failed: ${result?.reason ?? 'unknown_reason'}${details}`,
+        }));
+      }
+    } catch (err) {
+      setErrors((prev) => ({
+        ...prev,
+        [platformId]: err.message ?? 'Could not verify this platform session.',
+      }));
+    } finally {
+      setVerifyBusy((prev) => ({ ...prev, [platformId]: false }));
     }
   }
 
@@ -387,6 +476,8 @@ export default function ConnectPageV2() {
             const error = errors[platform.id];
             const isCapturing = Boolean(captureBusy[platform.id]);
             const isDisconnecting = Boolean(disconnectBusy[platform.id]);
+            const isVerifying = Boolean(verifyBusy[platform.id]);
+            const canVerify = typeof model.verify === 'function';
 
             return (
               <div key={platform.id} className="bg-white rounded-[12px] border border-[#E5E7EB] p-4">
@@ -451,6 +542,14 @@ export default function ConnectPageV2() {
                     className="px-3 py-2 rounded-[8px] border border-[#E5E7EB] bg-white text-[12px] font-semibold text-gray-700 disabled:opacity-50"
                   >
                     Refresh status
+                  </button>
+
+                  <button
+                    onClick={() => canVerify && handleVerify(platform.id, model.verify)}
+                    disabled={!canVerify || isVerifying || model.loading || model.syncing}
+                    className="px-3 py-2 rounded-[8px] border border-[#E5E7EB] bg-white text-[12px] font-semibold text-gray-700 disabled:opacity-50"
+                  >
+                    {isVerifying ? 'Verifying…' : 'Verify session'}
                   </button>
 
                   {connected && (

@@ -20,15 +20,18 @@
     "@capacitor/android": "^8.3.0",
     "@capacitor/core": "^8.3.0",
     "@capacitor/geolocation": "^8.2.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.18.0",
     "framer-motion": "^11.0.0",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.383.0",
     "pg": "^8.13.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-router-dom": "^7.0.0"
+    "react-router-dom": "^7.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.3.0",

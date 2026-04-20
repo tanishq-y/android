@@ -4,6 +4,9 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { Cache } from './cache.js';
 import { AlertManager } from './alertManager.js';
@@ -16,7 +19,10 @@ import {
 } from './platforms.js';
 
 import { pingDb } from './db.js';
+import { optionalAuthUser } from './middleware/auth.js';
 import { optionalUserContext, requireUserContext } from './middleware/userContext.js';
+import authRoutes from './routes/auth.js';
+import platformRoutes from './routes/platforms.js';
 import {
   disconnectBlinkit,
   disconnectInstamart,
@@ -24,6 +30,7 @@ import {
   getBlinkitCookieSession,
   getInstamartConnectionStatus,
   getInstamartCookieSession,
+  getPlatformSession,
   disconnectZepto,
   getZeptoConnectionStatus,
   getZeptoCookieSession,
@@ -32,7 +39,9 @@ import {
   listConnections,
   markBlinkitReconnectRequired,
   markInstamartReconnectRequired,
+  markPlatformReconnectRequired,
   markZeptoReconnectRequired,
+  storePlatformSession,
   storeBlinkitCookieSession,
   storeInstamartCookieSession,
   storeZeptoCookieSession,
@@ -45,9 +54,98 @@ const PORT = process.env.PORT ?? 3001;
 const cache = new Cache(300_000); // 5-minute TTL
 const alerts = new AlertManager();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const STALE_CACHE_FILE = path.join(__dirname, 'cache', 'staleSearch.json');
+const STALE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function ensureStaleCacheDir() {
+  try {
+    fs.mkdirSync(path.dirname(STALE_CACHE_FILE), { recursive: true });
+  } catch {
+    // Best effort.
+  }
+}
+
+function loadPersistentStaleCache() {
+  try {
+    ensureStaleCacheDir();
+    if (!fs.existsSync(STALE_CACHE_FILE)) {
+      return {};
+    }
+
+    const raw = fs.readFileSync(STALE_CACHE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePersistentStaleCache(store) {
+  try {
+    ensureStaleCacheDir();
+    fs.writeFileSync(STALE_CACHE_FILE, JSON.stringify(store), 'utf8');
+  } catch {
+    // Best effort.
+  }
+}
+
+const persistentStaleCacheStore = loadPersistentStaleCache();
+
+function readPersistentStaleSnapshot(cacheKey) {
+  const key = String(cacheKey ?? '').trim();
+  if (!key) return null;
+
+  const entry = persistentStaleCacheStore[key];
+  if (!entry || typeof entry !== 'object') return null;
+
+  const updatedAt = Number(entry.updatedAt ?? 0);
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > STALE_CACHE_TTL_MS) {
+    delete persistentStaleCacheStore[key];
+    return null;
+  }
+
+  const results = Array.isArray(entry.results) ? entry.results : [];
+  if (results.length === 0) return null;
+
+  return {
+    results,
+  };
+}
+
+function writePersistentStaleSnapshot(cacheKey, response) {
+  const key = String(cacheKey ?? '').trim();
+  if (!key) return;
+
+  const results = Array.isArray(response?.results) ? response.results : [];
+  if (results.length === 0) return;
+
+  persistentStaleCacheStore[key] = {
+    updatedAt: Date.now(),
+    results,
+  };
+
+  savePersistentStaleCache(persistentStaleCacheStore);
+}
+
 const PLATFORM_BLINKIT = 'blinkit';
 const PLATFORM_ZEPTO = 'zepto';
 const PLATFORM_INSTAMART = 'instamart';
+const PLATFORM_BIGBASKET = 'bigbasket';
+const PLATFORM_JIOMART = 'jiomart';
+const PLATFORM_ALL = [
+  PLATFORM_BLINKIT,
+  PLATFORM_ZEPTO,
+  PLATFORM_INSTAMART,
+  PLATFORM_BIGBASKET,
+  PLATFORM_JIOMART,
+];
+const PLATFORM_PILOT = [
+  PLATFORM_BLINKIT,
+  PLATFORM_ZEPTO,
+  PLATFORM_INSTAMART,
+];
 
 const allowedOrigins = new Set([
   'http://localhost:5173',
@@ -103,6 +201,7 @@ app.use(cors(corsOptions));
 
 app.use(express.json());
 app.use(optionalUserContext);
+app.use(optionalAuthUser);
 
 function respondTokenVaultUnavailable(res) {
   const mode = getTokenVaultMode();
@@ -116,7 +215,29 @@ function isSessionInvalidError(error) {
   return error === 'session_invalid' || error === 'HTTP 401' || error === 'HTTP 403';
 }
 
+async function markReconnectRequiredByPlatform(userId, platform, reason) {
+  if (!isSessionInvalidError(reason)) return;
+
+  if (platform === PLATFORM_BLINKIT) {
+    await markBlinkitReconnectRequired(userId, reason).catch(() => {});
+    return;
+  }
+
+  if (platform === PLATFORM_ZEPTO) {
+    await markZeptoReconnectRequired(userId, reason).catch(() => {});
+    return;
+  }
+
+  if (platform === PLATFORM_INSTAMART) {
+    await markInstamartReconnectRequired(userId, reason).catch(() => {});
+    return;
+  }
+
+  await markPlatformReconnectRequired(userId, platform, reason).catch(() => {});
+}
+
 const ENABLE_SYNTHETIC_FALLBACK = String(process.env.ENABLE_SYNTHETIC_FALLBACK ?? '').toLowerCase() === 'true';
+const ENABLE_JWT_HEADER_BRIDGE = String(process.env.ENABLE_JWT_HEADER_BRIDGE ?? 'true').toLowerCase() === 'true';
 
 function buildSyntheticFallbackResults(query) {
   const clean = String(query ?? '').trim();
@@ -181,6 +302,300 @@ function isAllPlatformsError(platformStatus) {
   return statuses.every((status) => typeof status === 'string' && status.startsWith('error:'));
 }
 
+function normalizeRequestedPlatforms(platforms) {
+  if (!Array.isArray(platforms) || platforms.length === 0) {
+    return [...PLATFORM_ALL];
+  }
+
+  return [...new Set(platforms.map((platform) => String(platform ?? '').trim().toLowerCase()))]
+    .filter((platform) => PLATFORM_ALL.includes(platform));
+}
+
+function createStringPlatformMap(platforms, defaultValue = 'none') {
+  return Object.fromEntries(platforms.map((platform) => [platform, defaultValue]));
+}
+
+function createBooleanPlatformMap(platforms, defaultValue = false) {
+  return Object.fromEntries(platforms.map((platform) => [platform, defaultValue]));
+}
+
+function buildConnectionHints({ requestedPlatforms, sessionSourceByPlatform, reconnectRequiredByPlatform }) {
+  return {
+    sessionSourceByPlatform,
+    reconnectRequiredByPlatform,
+    blinkit: sessionSourceByPlatform[PLATFORM_BLINKIT] ?? 'none',
+    zepto: sessionSourceByPlatform[PLATFORM_ZEPTO] ?? 'none',
+    instamart: sessionSourceByPlatform[PLATFORM_INSTAMART] ?? 'none',
+    blinkitReconnectRequired: Boolean(reconnectRequiredByPlatform[PLATFORM_BLINKIT]),
+    zeptoReconnectRequired: Boolean(reconnectRequiredByPlatform[PLATFORM_ZEPTO]),
+    instamartReconnectRequired: Boolean(reconnectRequiredByPlatform[PLATFORM_INSTAMART]),
+    requestedPlatforms,
+  };
+}
+
+function buildSearchDiagnostics({
+  authScope,
+  authUser,
+  headerUserId,
+  effectiveUserId,
+  identityMismatch,
+  authError,
+  requestedPlatforms,
+  sessionDiagnostics,
+  platformStatus,
+}) {
+  const failedPlatforms = Object.entries(platformStatus ?? {})
+    .filter(([, status]) => typeof status === 'string' && status.startsWith('error:'))
+    .map(([platform, status]) => ({
+      platform,
+      reason: String(status).replace(/^error:\s*/i, ''),
+    }));
+
+  return {
+    authScope,
+    authUserId: String(authUser?.id ?? '').trim() || null,
+    authEmail: String(authUser?.email ?? '').trim() || null,
+    headerUserId: headerUserId || null,
+    effectiveUserId: effectiveUserId || null,
+    identityMismatch,
+    authError: authError || null,
+    requestedPlatforms,
+    failedPlatforms,
+    sessionDiagnostics,
+  };
+}
+
+function buildSearchResponse({
+  query,
+  requestedPlatforms,
+  results,
+  platformStatus,
+  fallbackUsed,
+  fallbackReason,
+  connectionHints,
+  searchDiagnostics,
+}) {
+  return {
+    type: 'SERVER_RESULTS',
+    query,
+    resolvedAt: new Date().toISOString(),
+    results,
+    platformStatus,
+    totalPlatforms: requestedPlatforms.length,
+    resolved: requestedPlatforms.length,
+    fallbackUsed,
+    fallbackReason,
+    connectionHints,
+    searchDiagnostics,
+  };
+}
+
+function buildCookieHeaderFromSession(session) {
+  const cookies = session?.cookies && typeof session.cookies === 'object'
+    ? session.cookies
+    : {};
+
+  const entries = Object.entries(cookies)
+    .map(([key, value]) => [String(key ?? '').trim(), String(value ?? '').trim()])
+    .filter(([key, value]) => key && value);
+
+  if (entries.length > 0) {
+    return entries.map(([key, value]) => `${key}=${value}`).join('; ');
+  }
+
+  const fromHeaders = String(session?.headers?.Cookie ?? session?.headers?.cookie ?? '').trim();
+  return fromHeaders;
+}
+
+async function getBestSessionInputForPlatform(userId, platform, loadCookieSession) {
+  const fullSession = await getPlatformSession(userId, platform).catch(() => null);
+  if (fullSession && typeof fullSession === 'object') {
+    const cookieCount = Object.keys(fullSession.cookies ?? {}).length;
+    const headerCount = Object.keys(fullSession.headers ?? {}).length;
+    if (cookieCount > 0 || headerCount > 0) {
+      return {
+        sessionInput: fullSession,
+        source: 'full_session',
+      };
+    }
+  }
+
+  const cookieSession = await loadCookieSession(userId).catch(() => null);
+  if (cookieSession?.cookieHeader) {
+    return {
+      sessionInput: cookieSession.cookieHeader,
+      source: 'cookie_header',
+    };
+  }
+
+  return {
+    sessionInput: null,
+    source: 'none',
+  };
+}
+
+function deriveLegacyDeviceUserIdFromEmail(email) {
+  const safeEmail = String(email ?? '').trim().toLowerCase();
+  const match = safeEmail.match(/^device\.([a-z0-9]{32})@flit\.local$/i);
+  if (!match) return null;
+
+  const compact = match[1];
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20, 32)}`;
+}
+
+function toSessionPayload(session) {
+  return {
+    cookies: session?.cookies && typeof session.cookies === 'object' ? session.cookies : {},
+    headers: session?.headers && typeof session.headers === 'object' ? session.headers : {},
+    extra: session?.extra && typeof session.extra === 'object' ? session.extra : {},
+  };
+}
+
+async function getSessionForJwtSearch({ authUser, platform, fallbackUserId = null }) {
+  const authUserId = String(authUser?.id ?? '').trim();
+  if (!authUserId) {
+    return {
+      session: null,
+      source: 'missing_auth_user',
+      userId: null,
+      migrated: false,
+    };
+  }
+
+  const directSession = await getPlatformSession(authUserId, platform);
+  if (directSession) {
+    return {
+      session: directSession,
+      source: 'jwt_user',
+      userId: authUserId,
+      migrated: false,
+    };
+  }
+
+  const rawFallbackUserId = String(fallbackUserId ?? '').trim();
+  const headerFallbackUserId = ENABLE_JWT_HEADER_BRIDGE ? rawFallbackUserId : '';
+  if (headerFallbackUserId && headerFallbackUserId !== authUserId) {
+    const fallbackSession = await getPlatformSession(headerFallbackUserId, platform);
+    if (fallbackSession) {
+      let source = 'header_bridge';
+      let migrated = false;
+
+      await storePlatformSession({
+        userId: authUserId,
+        platform,
+        session: toSessionPayload(fallbackSession),
+        expiresAt: fallbackSession?.expiresAt ?? null,
+      })
+        .then(() => {
+          source = 'header_bridge_migrated';
+          migrated = true;
+        })
+        .catch((err) => {
+          source = 'header_bridge_migration_failed';
+          console.warn(`[Search JWT] Could not migrate ${platform} header-fallback session:`, err.message);
+        });
+
+      return {
+        session: fallbackSession,
+        source,
+        userId: authUserId,
+        fallbackUserId: headerFallbackUserId,
+        migrated,
+      };
+    }
+  }
+
+  const legacyUserId = deriveLegacyDeviceUserIdFromEmail(authUser?.email);
+  if (!legacyUserId || legacyUserId === authUserId) {
+    return {
+      session: null,
+      source: 'not_found',
+      userId: authUserId,
+      fallbackUserId: headerFallbackUserId || null,
+      migrated: false,
+    };
+  }
+
+  const legacySession = await getPlatformSession(legacyUserId, platform);
+  if (!legacySession) {
+    return {
+      session: null,
+      source: 'not_found',
+      userId: authUserId,
+      fallbackUserId: headerFallbackUserId || null,
+      legacyUserId,
+      migrated: false,
+    };
+  }
+
+  // One-time bridge: hydrate JWT user context from legacy device-id sessions.
+  let source = 'legacy_bridge';
+  let migrated = false;
+
+  await storePlatformSession({
+    userId: authUserId,
+    platform,
+    session: toSessionPayload(legacySession),
+    expiresAt: legacySession?.expiresAt ?? null,
+  })
+    .then(() => {
+      source = 'legacy_bridge_migrated';
+      migrated = true;
+    })
+    .catch((err) => {
+      source = 'legacy_bridge_migration_failed';
+      console.warn(`[Search JWT] Could not migrate ${platform} legacy session:`, err.message);
+    });
+
+  return {
+    session: legacySession,
+    source,
+    userId: authUserId,
+    fallbackUserId: headerFallbackUserId || null,
+    legacyUserId,
+    migrated,
+  };
+}
+
+function createPlatformSearchTask({ platform, query, latitude, longitude, sessionInput }) {
+  if (platform === PLATFORM_BLINKIT) {
+    return {
+      platform,
+      promise: searchBlinkit(query, latitude, longitude, sessionInput),
+    };
+  }
+
+  if (platform === PLATFORM_ZEPTO) {
+    return {
+      platform,
+      promise: searchZepto(query, latitude, longitude, sessionInput),
+    };
+  }
+
+  if (platform === PLATFORM_INSTAMART) {
+    return {
+      platform,
+      promise: searchInstamart(query, latitude, longitude, sessionInput),
+    };
+  }
+
+  if (platform === PLATFORM_BIGBASKET) {
+    return {
+      platform,
+      promise: searchBigBasket(query, sessionInput),
+    };
+  }
+
+  if (platform === PLATFORM_JIOMART) {
+    return {
+      platform,
+      promise: searchJioMart(query, sessionInput),
+    };
+  }
+
+  return null;
+}
+
 // ─── HEALTH CHECK ───────────────────────────────────────────────────────────
 
 app.get('/api/health', async (_req, res) => {
@@ -197,9 +612,15 @@ app.get('/api/health', async (_req, res) => {
       available: tokenVaultMode !== 'unavailable',
     },
     syntheticFallbackEnabled: ENABLE_SYNTHETIC_FALLBACK,
-    message: 'Flit server running. App-first token-vault flow active with Blinkit + Zepto + Instamart pilots.',
+      jwtHeaderBridgeEnabled: ENABLE_JWT_HEADER_BRIDGE,
+      message: 'Flit server running. App-first token-vault flow active with Blinkit + Zepto + Instamart pilots.',
   });
 });
+
+// ─── SPEC ROUTES (JWT) ─────────────────────────────────────────────────────
+
+app.use('/api/auth', authRoutes);
+app.use('/api/platforms', platformRoutes);
 
 // ─── V2 CONNECTION ROUTES (TOKEN-VAULT PILOTS) ─────────────────────────────
 
@@ -365,8 +786,12 @@ app.post('/api/v2/search/blinkit', requireUserContext, async (req, res) => {
       return res.status(400).json({ error: 'query is required' });
     }
 
-    const session = await getBlinkitCookieSession(req.userId);
-    if (!session?.cookieHeader) {
+    const sessionLookup = await getBestSessionInputForPlatform(
+      req.userId,
+      PLATFORM_BLINKIT,
+      getBlinkitCookieSession
+    );
+    if (!sessionLookup.sessionInput) {
       return res.status(412).json({
         error: 'blinkit_not_connected',
         reconnectRequired: true,
@@ -377,7 +802,7 @@ app.post('/api/v2/search/blinkit', requireUserContext, async (req, res) => {
     const latitude = lat ?? 28.4595;
     const longitude = lon ?? 77.0266;
 
-    const result = await searchBlinkit(query.trim(), latitude, longitude, session.cookieHeader);
+    const result = await searchBlinkit(query.trim(), latitude, longitude, sessionLookup.sessionInput);
 
     if (result.error) {
       if (isSessionInvalidError(result.error)) {
@@ -413,8 +838,12 @@ app.post('/api/v2/search/zepto', requireUserContext, async (req, res) => {
       return res.status(400).json({ error: 'query is required' });
     }
 
-    const session = await getZeptoCookieSession(req.userId);
-    if (!session?.cookieHeader) {
+    const sessionLookup = await getBestSessionInputForPlatform(
+      req.userId,
+      PLATFORM_ZEPTO,
+      getZeptoCookieSession
+    );
+    if (!sessionLookup.sessionInput) {
       return res.status(412).json({
         error: 'zepto_not_connected',
         reconnectRequired: true,
@@ -425,7 +854,7 @@ app.post('/api/v2/search/zepto', requireUserContext, async (req, res) => {
     const latitude = lat ?? 28.4595;
     const longitude = lon ?? 77.0266;
 
-    const result = await searchZepto(query.trim(), latitude, longitude, session.cookieHeader);
+    const result = await searchZepto(query.trim(), latitude, longitude, sessionLookup.sessionInput);
 
     if (result.error) {
       if (isSessionInvalidError(result.error)) {
@@ -461,8 +890,12 @@ app.post('/api/v2/search/instamart', requireUserContext, async (req, res) => {
       return res.status(400).json({ error: 'query is required' });
     }
 
-    const session = await getInstamartCookieSession(req.userId);
-    if (!session?.cookieHeader) {
+    const sessionLookup = await getBestSessionInputForPlatform(
+      req.userId,
+      PLATFORM_INSTAMART,
+      getInstamartCookieSession
+    );
+    if (!sessionLookup.sessionInput) {
       return res.status(412).json({
         error: 'instamart_not_connected',
         reconnectRequired: true,
@@ -473,7 +906,7 @@ app.post('/api/v2/search/instamart', requireUserContext, async (req, res) => {
     const latitude = lat ?? 28.4595;
     const longitude = lon ?? 77.0266;
 
-    const result = await searchInstamart(query.trim(), latitude, longitude, session.cookieHeader);
+    const result = await searchInstamart(query.trim(), latitude, longitude, sessionLookup.sessionInput);
 
     if (result.error) {
       if (isSessionInvalidError(result.error)) {
@@ -506,143 +939,291 @@ app.post('/api/v2/search/instamart', requireUserContext, async (req, res) => {
 
 app.post('/api/search', async (req, res) => {
   try {
-    const { query, lat, lon } = req.body ?? {};
+    const hasAuthorizationHeader = Boolean(
+      String(req.get('Authorization') ?? req.get('authorization') ?? '').trim()
+    );
+
+    const headerUserId = String(req.get('x-flit-user-id') ?? '').trim() || null;
+    const requestUserId = String(req.userId ?? '').trim() || null;
+    const authUserId = String(req.authUser?.id ?? '').trim() || null;
+    const effectiveUserId = authUserId || requestUserId || headerUserId;
+    const identityMismatch = Boolean(authUserId && headerUserId && authUserId !== headerUserId);
+    const authScope = hasAuthorizationHeader && req.authUser ? 'jwt' : 'legacy';
+
+    if (identityMismatch) {
+      if (ENABLE_JWT_HEADER_BRIDGE) {
+        console.warn(`[Search] Identity mismatch: jwt=${authUserId}, header=${headerUserId}`);
+      } else {
+        console.warn(`[Search] Identity mismatch ignored (header bridge disabled): jwt=${authUserId}, header=${headerUserId}`);
+      }
+    }
+
+    if (hasAuthorizationHeader && req.authError) {
+      console.warn(`[Search] Auth error for request: ${req.authError}, userId header: ${headerUserId ?? 'none'}`);
+      // Don't block — fall through to legacy path if we have a userId from header
+      if (!effectiveUserId) {
+        return res.status(401).json({ error: req.authError });
+      }
+    }
+
+    if (hasAuthorizationHeader && !req.authUser && !effectiveUserId) {
+      return res.status(401).json({ error: 'invalid_token' });
+    }
+
+    const { query, lat, lon, platforms } = req.body ?? {};
     if (!query || !query.trim()) {
       return res.status(400).json({ error: 'query is required' });
     }
 
+    const trimmedQuery = query.trim();
     const latitude = lat ?? 28.4595;
     const longitude = lon ?? 77.0266;
+    const requestedPlatforms = normalizeRequestedPlatforms(platforms);
+    const platformStatus = Object.fromEntries(requestedPlatforms.map((platform) => [platform, 'not_connected']));
+    const sessionSourceByPlatform = createStringPlatformMap(requestedPlatforms, 'none');
+    const reconnectRequiredByPlatform = createBooleanPlatformMap(requestedPlatforms, false);
+    const sessionDiagnostics = {};
+    const platformTasks = [];
+    let cacheKey = null;
 
-    let blinkitCookieHeader = null;
-    let blinkitSessionSource = 'none';
-    let zeptoCookieHeader = null;
-    let zeptoSessionSource = 'none';
-    let instamartCookieHeader = null;
-    let instamartSessionSource = 'none';
+    if (authScope === 'jwt') {
+      console.log(`[Search JWT] User: ${authUserId}, email: ${req.authUser?.email ?? 'none'}, platforms: [${requestedPlatforms.join(', ')}]`);
+      const jwtFallbackUserId = ENABLE_JWT_HEADER_BRIDGE ? headerUserId : null;
 
-    if (isTokenVaultAvailable() && req.userId) {
-      try {
-        const blinkitSession = await getBlinkitCookieSession(req.userId);
-        if (blinkitSession?.cookieHeader) {
-          blinkitCookieHeader = blinkitSession.cookieHeader;
-          blinkitSessionSource = 'token_vault';
+      for (const platform of requestedPlatforms) {
+        try {
+          const lookup = await getSessionForJwtSearch({
+            authUser: req.authUser,
+            platform,
+            fallbackUserId: jwtFallbackUserId,
+          });
+
+          sessionSourceByPlatform[platform] = lookup?.source ?? 'not_found';
+
+          if (!lookup?.session) {
+            sessionDiagnostics[platform] = {
+              source: sessionSourceByPlatform[platform],
+              sessionFound: false,
+            };
+            continue;
+          }
+
+          const session = lookup.session;
+          const cookieHeader = buildCookieHeaderFromSession(session);
+          const headerCount = Object.keys(session?.headers ?? {}).length;
+          const hasSessionHeaders = headerCount > 0;
+
+          sessionDiagnostics[platform] = {
+            source: sessionSourceByPlatform[platform],
+            sessionFound: true,
+            cookieLength: cookieHeader?.length ?? 0,
+            headerCount,
+            extraCount: Object.keys(session?.extra ?? {}).length,
+          };
+
+          if ((!cookieHeader || !cookieHeader.includes('=')) && !hasSessionHeaders) {
+            console.warn(`[Search JWT] ${platform}: session exists but has no usable cookies or headers — skipping`);
+            sessionDiagnostics[platform].skipped = 'no_usable_cookie_or_header';
+            continue;
+          }
+
+          const task = createPlatformSearchTask({
+            platform,
+            query: trimmedQuery,
+            latitude,
+            longitude,
+            sessionInput: session,
+          });
+
+          if (!task) {
+            platformStatus[platform] = 'error: unsupported_platform';
+            continue;
+          }
+
+          platformTasks.push(task);
+        } catch (err) {
+          platformStatus[platform] = 'error: session_load_failed';
+          sessionDiagnostics[platform] = {
+            source: sessionSourceByPlatform[platform] ?? 'lookup_failed',
+            sessionFound: false,
+            error: err.message,
+          };
+          console.warn(`[Search JWT] ${platform} session load failed:`, err.message);
         }
-      } catch (err) {
-        console.warn('[Server Search] Could not read Blinkit token vault session:', err.message);
       }
-
-      try {
-        const zeptoSession = await getZeptoCookieSession(req.userId);
-        if (zeptoSession?.cookieHeader) {
-          zeptoCookieHeader = zeptoSession.cookieHeader;
-          zeptoSessionSource = 'token_vault';
-        }
-      } catch (err) {
-        console.warn('[Server Search] Could not read Zepto token vault session:', err.message);
-      }
-
-      try {
-        const instamartSession = await getInstamartCookieSession(req.userId);
-        if (instamartSession?.cookieHeader) {
-          instamartCookieHeader = instamartSession.cookieHeader;
-          instamartSessionSource = 'token_vault';
-        }
-      } catch (err) {
-        console.warn('[Server Search] Could not read Instamart token vault session:', err.message);
-      }
-    }
-
-    // Search output is user-contextual (session-backed), so cache must be scoped per user.
-    const cacheUserScope = req.userId ? `user:${req.userId}` : 'anon';
-    const cacheKey = `search:${cacheUserScope}:${query.trim().toLowerCase()}:${latitude}:${longitude}:blinkit=${blinkitSessionSource}:zepto=${zeptoSessionSource}:instamart=${instamartSessionSource}`;
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      console.log(`[Server Search] Cache hit for "${query}"`);
-      return res.json(cached);
-    }
-
-    console.log(
-      `[Server Search] Searching "${query}" at ${latitude},${longitude} (blinkit session: ${blinkitSessionSource}, zepto session: ${zeptoSessionSource}, instamart session: ${instamartSessionSource})`
-    );
-
-    const settled = await Promise.allSettled([
-      searchBlinkit(query.trim(), latitude, longitude, blinkitCookieHeader),
-      searchZepto(query.trim(), latitude, longitude, zeptoCookieHeader),
-      searchInstamart(query.trim(), latitude, longitude, instamartCookieHeader),
-      searchBigBasket(query.trim()),
-      searchJioMart(query.trim()),
-    ]);
-
-    const platformOrder = ['blinkit', 'zepto', 'instamart', 'bigbasket', 'jiomart'];
-    const results = settled.map((outcome, idx) => {
-      if (outcome.status === 'fulfilled') return outcome.value;
-      return {
-        platform: platformOrder[idx],
-        products: [],
-        error: outcome.reason?.message ?? 'exception',
+    } else {
+      const sessionInputByPlatform = {
+        [PLATFORM_BLINKIT]: null,
+        [PLATFORM_ZEPTO]: null,
+        [PLATFORM_INSTAMART]: null,
       };
+
+      if (isTokenVaultAvailable() && effectiveUserId) {
+        const requestedPilotPlatforms = requestedPlatforms.filter((platform) => PLATFORM_PILOT.includes(platform));
+        const cookieSessionLoaders = {
+          [PLATFORM_BLINKIT]: getBlinkitCookieSession,
+          [PLATFORM_ZEPTO]: getZeptoCookieSession,
+          [PLATFORM_INSTAMART]: getInstamartCookieSession,
+        };
+
+        for (const platform of requestedPilotPlatforms) {
+          try {
+            const lookup = await getBestSessionInputForPlatform(
+              effectiveUserId,
+              platform,
+              cookieSessionLoaders[platform]
+            );
+
+            if (!lookup.sessionInput) {
+              continue;
+            }
+
+            sessionInputByPlatform[platform] = lookup.sessionInput;
+            sessionSourceByPlatform[platform] = lookup.source === 'full_session'
+              ? 'token_vault_session'
+              : 'token_vault';
+          } catch (err) {
+            console.warn(`[Server Search] Could not read ${platform} token vault session:`, err.message);
+          }
+        }
+      }
+
+      for (const platform of requestedPlatforms) {
+        const sessionInput = sessionInputByPlatform[platform] ?? null;
+
+        if (PLATFORM_PILOT.includes(platform) && !sessionInput) {
+          sessionDiagnostics[platform] = {
+            source: sessionSourceByPlatform[platform],
+            sessionFound: false,
+          };
+          platformStatus[platform] = 'not_connected';
+          continue;
+        }
+
+        if (!sessionSourceByPlatform[platform] || sessionSourceByPlatform[platform] === 'none') {
+          sessionSourceByPlatform[platform] = PLATFORM_PILOT.includes(platform)
+            ? 'none'
+            : 'public_endpoint';
+        }
+
+        const isObjectSessionInput = Boolean(sessionInput && typeof sessionInput === 'object');
+        const cookieLength = isObjectSessionInput
+          ? buildCookieHeaderFromSession(sessionInput).length
+          : (sessionInput ? String(sessionInput).length : 0);
+        const headerCount = isObjectSessionInput
+          ? Object.keys(sessionInput.headers ?? {}).length
+          : 0;
+
+        sessionDiagnostics[platform] = {
+          source: sessionSourceByPlatform[platform],
+          sessionFound: Boolean(sessionInput),
+          sessionInputType: isObjectSessionInput ? 'session_object' : (sessionInput ? 'cookie_header' : 'none'),
+          cookieLength,
+          headerCount,
+        };
+
+        const task = createPlatformSearchTask({
+          platform,
+          query: trimmedQuery,
+          latitude,
+          longitude,
+          sessionInput,
+        });
+
+        if (!task) {
+          platformStatus[platform] = 'error: unsupported_platform';
+          continue;
+        }
+
+        platformTasks.push(task);
+      }
+
+      const cacheUserScope = effectiveUserId ? `user:${effectiveUserId}` : 'anon';
+      const sessionScope = requestedPlatforms
+        .map((platform) => `${platform}:${sessionSourceByPlatform[platform] ?? 'none'}`)
+        .join('|');
+      cacheKey = `search:v2:${authScope}:${cacheUserScope}:${trimmedQuery.toLowerCase()}:${latitude}:${longitude}:platforms=${requestedPlatforms.join(',')}:sessions=${sessionScope}`;
+
+      // Live-only mode: always fetch fresh platform data for each search request.
+
+      console.log(
+        `[Server Search] Searching "${query}" at ${latitude},${longitude} | effectiveUserId: ${effectiveUserId ?? 'none'} | scope: ${authScope} | sessions: ${sessionScope}`
+      );
+    }
+
+    const settled = await Promise.allSettled(platformTasks.map((task) => task.promise));
+    const allProducts = [];
+
+    for (let index = 0; index < settled.length; index += 1) {
+      const outcome = settled[index];
+      const task = platformTasks[index];
+      const platform = task.platform;
+
+      if (outcome.status !== 'fulfilled') {
+        platformStatus[platform] = 'error: exception';
+        continue;
+      }
+
+      const result = outcome.value;
+      if (result.error) {
+        platformStatus[platform] = `error: ${result.error}`;
+        reconnectRequiredByPlatform[platform] = isSessionInvalidError(result.error);
+
+        if (reconnectRequiredByPlatform[platform] && isTokenVaultAvailable() && effectiveUserId) {
+          await markReconnectRequiredByPlatform(effectiveUserId, platform, result.error);
+        }
+        continue;
+      }
+
+      const statusHint = String(result?.status ?? '').trim();
+      platformStatus[platform] = statusHint || 'ok';
+      reconnectRequiredByPlatform[platform] = false;
+      allProducts.push(...(result.products ?? []));
+    }
+
+    const hasConnectedSessionContext = requestedPlatforms.some((platform) => {
+      const source = String(sessionSourceByPlatform[platform] ?? '').trim().toLowerCase();
+      return source && source !== 'none';
     });
 
-    const allProducts = [];
-    const platformStatus = {};
-    for (const r of results) {
-      platformStatus[r.platform] = r.error ? `error: ${r.error}` : 'ok';
-      allProducts.push(...(r.products ?? []));
-    }
+    const syntheticFallbackUsed = false;
+    const fallbackReason = 'none';
+    const connectionHints = buildConnectionHints({
+      requestedPlatforms,
+      sessionSourceByPlatform,
+      reconnectRequiredByPlatform,
+    });
+    const searchDiagnostics = buildSearchDiagnostics({
+      authScope,
+      authUser: req.authUser,
+      headerUserId,
+      effectiveUserId,
+      identityMismatch,
+      authError: req.authError,
+      requestedPlatforms,
+      sessionDiagnostics,
+      platformStatus,
+    });
 
-    const blinkitResult = results.find((r) => r.platform === PLATFORM_BLINKIT);
-    const zeptoResult = results.find((r) => r.platform === PLATFORM_ZEPTO);
-    const instamartResult = results.find((r) => r.platform === PLATFORM_INSTAMART);
-    const blinkitReconnectRequired = Boolean(blinkitResult?.error && isSessionInvalidError(blinkitResult.error));
-    const zeptoReconnectRequired = Boolean(zeptoResult?.error && isSessionInvalidError(zeptoResult.error));
-    const instamartReconnectRequired = Boolean(instamartResult?.error && isSessionInvalidError(instamartResult.error));
-
-    if (blinkitReconnectRequired && isTokenVaultAvailable() && req.userId) {
-      await markBlinkitReconnectRequired(req.userId, blinkitResult.error).catch(() => {});
-    }
-
-    if (zeptoReconnectRequired && isTokenVaultAvailable() && req.userId) {
-      await markZeptoReconnectRequired(req.userId, zeptoResult.error).catch(() => {});
-    }
-
-    if (instamartReconnectRequired && isTokenVaultAvailable() && req.userId) {
-      await markInstamartReconnectRequired(req.userId, instamartResult.error).catch(() => {});
-    }
-
-    const syntheticFallbackUsed =
-      ENABLE_SYNTHETIC_FALLBACK && shouldUseSyntheticFallback(allProducts, platformStatus);
-    if (syntheticFallbackUsed) {
-      allProducts.push(...buildSyntheticFallbackResults(query.trim()));
-      platformStatus.synthetic_fallback = 'ok';
-    }
-
-    const response = {
-      type: 'SERVER_RESULTS',
+    let response = buildSearchResponse({
+      query: trimmedQuery,
+      requestedPlatforms,
       results: allProducts,
       platformStatus,
-      totalPlatforms: 5,
-      resolved: results.length,
       fallbackUsed: syntheticFallbackUsed,
-      connectionHints: {
-        blinkit: blinkitSessionSource,
-        zepto: zeptoSessionSource,
-        instamart: instamartSessionSource,
-        blinkitReconnectRequired,
-        zeptoReconnectRequired,
-        instamartReconnectRequired,
-      },
-    };
+      fallbackReason,
+      connectionHints,
+      searchDiagnostics,
+    });
 
-    const totalFailure = response.results.length === 0 && isAllPlatformsError(platformStatus);
-    if (!totalFailure) {
-      cache.set(cacheKey, response);
-    }
+    // Live-only mode: do not cache /api/search responses.
+
     console.log(
-      `[Server Search] Done: ${allProducts.length} products from ${results.filter((r) => !r.error).length}/5 platforms`
+      `[Server Search] Done: ${allProducts.length} products from ${platformTasks.filter((task, idx) => settled[idx]?.status === 'fulfilled' && !settled[idx].value?.error).length}/${requestedPlatforms.length} platforms | scope=${authScope}`
     );
 
     return res.json(response);
+
   } catch (err) {
     console.error('[Server Search] Failed:', err.message);
     return res.status(500).json({ error: err.message ?? 'Server search failed' });
@@ -706,6 +1287,13 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Flit server — http://localhost:${PORT}`);
   console.log('Routes:');
   console.log('  GET  /api/health');
+  console.log('  POST /api/auth/register');
+  console.log('  POST /api/auth/login');
+  console.log('  POST /api/auth/refresh');
+  console.log('  POST /api/platforms/connect');
+  console.log('  GET  /api/platforms/status');
+  console.log('  DELETE /api/platforms/:platform');
+  console.log('  POST /api/platforms/:platform/verify');
   console.log('  POST /api/search');
   console.log('  POST /api/alerts/save');
   console.log('  POST /api/alerts/check');

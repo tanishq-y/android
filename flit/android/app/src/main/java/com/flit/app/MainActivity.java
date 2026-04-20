@@ -19,6 +19,18 @@ public class MainActivity extends BridgeActivity {
 		"}," +
 		"exportPlatformSession:function(platformId){" +
 		"return window.FlitNativeAndroid.exportPlatformSession(String(platformId||''));" +
+		"}," +
+		"startDeviceSearch:function(payload){" +
+		"var raw=window.FlitNativeAndroid.startDeviceSearch(JSON.stringify(payload||{}));" +
+		"try{return JSON.parse(raw);}catch(e){return {error:'invalid_native_response',raw:raw};}" +
+		"}," +
+		"getDeviceSearchStatus:function(jobId){" +
+		"var raw=window.FlitNativeAndroid.getDeviceSearchStatus(String(jobId||''));" +
+		"try{return JSON.parse(raw);}catch(e){return {error:'invalid_native_response',raw:raw};}" +
+		"}," +
+		"cancelDeviceSearch:function(jobId){" +
+		"var raw=window.FlitNativeAndroid.cancelDeviceSearch(String(jobId||''));" +
+		"try{return JSON.parse(raw);}catch(e){return {error:'invalid_native_response',raw:raw};}" +
 		"}" +
 		"};" +
 		"})();";

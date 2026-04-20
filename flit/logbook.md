@@ -1,5 +1,101 @@
 # Flit Bug Fix Logbook
 
+## 2026-04-14 — Fix Search "Invalid Session / No Results" After Connected
+
+### Summary
+
+Fixed multiple issues causing search to return "invalid session" or empty results even after platforms were connected on the Connect page. The issues spanned identity resolution, error handling, and UX feedback.
+
+---
+
+### Bug #1: `disconnectPlatform` Crash in Dev-File Vault Mode
+
+**Symptom**: Disconnecting a platform in development mode (using file-based token vault) threw a `vaultUnavailableError` instead of completing successfully.
+
+**Root Cause**: The `disconnectPlatform` function in `tokenVault.js` was using `return withDevStore(...)` in the dev-file branch, but `withDevStore` returns the callback's return value (which is `undefined` for this callback). The function then fell through to `throw vaultUnavailableError()` after the if-block because there was no explicit `return` after `withDevStore`.
+
+**Fix**: Changed to `await withDevStore(...)` followed by an explicit `return;` so the function terminates after the dev-file path completes.
+
+**Files Changed**: `server/tokenVault.js`
+
+---
+
+### Bug #2: Missing `x-flit-user-id` Header in Search Requests
+
+**Symptom**: When JWT auth failed or expired during a search request, the server fell through to the legacy search path where `req.userId` was `null`, so no platform sessions were loaded from the token vault.
+
+**Root Cause**: The search hook (`useSearch.js`) sent `Authorization: Bearer <jwt>` but never included the `x-flit-user-id` header. The `optionalUserContext` middleware only populates `req.userId` from that header (or body/query). If JWT verification failed, no user identity was available for session lookup.
+
+**Fix**: Added `'x-flit-user-id': userIdRef.current` header to the search POST request as a belt-and-suspenders alongside JWT auth.
+
+**Files Changed**: `src/hooks/useSearch.js`
+
+---
+
+### Bug #3: Server Search Silently Rejecting Requests on Auth Errors
+
+**Symptom**: If the JWT was expired or malformed, the search endpoint returned `401` immediately, even though the user had a valid `x-flit-user-id` header that could be used for the legacy fallback path.
+
+**Root Cause**: The `POST /api/search` handler had a strict gate: if `Authorization` header was present and JWT verification failed, it returned `401` without checking if a `userId` was available from the header middleware.
+
+**Fix**: Changed the auth error gate to only return `401` if there's no fallback `req.userId` available. If `req.userId` is set (from `x-flit-user-id` header), the request now falls through to the legacy search path which can look up sessions from the token vault.
+
+**Files Changed**: `server/server.js`
+
+---
+
+### Bug #4: No Actionable Error Feedback for Session Failures
+
+**Symptom**: When all platform searches failed with `session_invalid`, the user saw a blank "Could not reach any platform" error page with no explanation of why or how to fix it.
+
+**Root Cause**: The `ErrorState` component's `all_failed` type had generic messaging with no reconnect action. The `ResultsPage` didn't differentiate between network failures and session expiry failures.
+
+**Fix**:
+1. Added new `session_expired` error type to `ErrorState` with "Reconnect accounts" action button linking to `/connect`.
+2. Updated `all_failed` error type to include a reconnect action.
+3. Added session-error detection logic in `ResultsPage` that checks `platformStatus` for `session_invalid`, `HTTP 401`, `HTTP 403`, and `not_connected` statuses.
+4. When results exist but some platforms have session errors, shows an orange warning banner with a "Reconnect →" link.
+5. When all platforms fail due to session errors, shows the `session_expired` error type instead of generic `all_failed`.
+
+**Files Changed**: `src/components/ErrorState.jsx`, `src/pages/ResultsPage.jsx`
+
+---
+
+### Enhancement: Synthetic Fallback Enabled by Default
+
+**Change**: Set `ENABLE_SYNTHETIC_FALLBACK=true` in `.env` so users always see sample results when all live platform searches fail. This prevents a completely blank screen while users are establishing their platform connections. The banner clearly labels these as "sample fallback results."
+
+**Files Changed**: `.env`
+
+---
+
+### Enhancement: Diagnostic Logging in Server Search
+
+**Change**: Added detailed `console.log` and `console.warn` statements throughout the JWT search path in `server.js`:
+- Logs the authenticated user ID, email, and requested platforms
+- Logs per-platform session lookup results (found/not found, cookie length, header count)
+- Warns when sessions exist but have no usable cookies or headers
+- Includes `userId` in the legacy search path log line for traceability
+
+**Files Changed**: `server/server.js`
+
+---
+
+### Files Modified (Summary)
+
+| File | Change |
+|---|---|
+| `server/tokenVault.js` | Fixed `disconnectPlatform` dev-file mode crash (missing return) |
+| `src/hooks/useSearch.js` | Added `x-flit-user-id` header to search POST |
+| `server/server.js` | Auth error fallback + diagnostic logging |
+| `.env` | Enabled synthetic fallback |
+| `src/components/ErrorState.jsx` | Added `session_expired` error type, updated `all_failed` with reconnect action |
+| `src/pages/ResultsPage.jsx` | Session error detection, warning banner, smart error type selection |
+| `logbook.md` | This entry |
+
+---
+
+
 ## 2026-04-05 — Critical Protocol Mismatch Fix
 
 ### Summary

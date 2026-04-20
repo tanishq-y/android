@@ -41,8 +41,28 @@ const CONFIGS = {
     Icon:  AlertTriangle,
     color: '#EF4444',
     title: 'Could not reach any platform',
-    body:  'All 5 platforms failed to respond. Check your internet connection, make sure you\'re logged in on each platform, and try again.',
-    actions: [],
+    body:  'All platforms failed to respond. Your sessions may have expired, or the platforms are temporarily unavailable.',
+    actions: [
+      {
+        label:   'Reconnect accounts',
+        href:    '/connect',
+        primary: true,
+      },
+    ],
+  },
+
+  session_expired: {
+    Icon:  Link2,
+    color: '#F59E0B',
+    title: 'Platform sessions expired',
+    body:  'Your connected platform sessions are no longer valid. Please reconnect your accounts to resume searching with real prices.',
+    actions: [
+      {
+        label:   'Reconnect accounts',
+        href:    '/connect',
+        primary: true,
+      },
+    ],
   },
 
   generic: {

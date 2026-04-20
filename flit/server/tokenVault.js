@@ -8,8 +8,17 @@ import { encryptSecret, decryptSecret } from './security/tokenCrypto.js';
 const PLATFORM_BLINKIT = 'blinkit';
 const PLATFORM_ZEPTO = 'zepto';
 const PLATFORM_INSTAMART = 'instamart';
+const PLATFORM_BIGBASKET = 'bigbasket';
+const PLATFORM_JIOMART = 'jiomart';
 const TOKEN_TYPE_COOKIE = 'cookie_header';
-const SUPPORTED_PLATFORMS = new Set([PLATFORM_BLINKIT, PLATFORM_ZEPTO, PLATFORM_INSTAMART]);
+const TOKEN_TYPE_SESSION_JSON = 'session_json';
+const SUPPORTED_PLATFORMS = new Set([
+  PLATFORM_BLINKIT,
+  PLATFORM_ZEPTO,
+  PLATFORM_INSTAMART,
+  PLATFORM_BIGBASKET,
+  PLATFORM_JIOMART,
+]);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,6 +64,149 @@ function normaliseExpiresAt(expiresAt) {
   const dt = new Date(expiresAt);
   if (Number.isNaN(dt.getTime())) return null;
   return dt.toISOString();
+}
+
+function normaliseStringMap(input) {
+  if (!input || typeof input !== 'object') return {};
+
+  const out = {};
+
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = String(rawKey ?? '').trim();
+    const value = String(rawValue ?? '').trim();
+    if (!key || !value) continue;
+    out[key] = value;
+  }
+
+  return out;
+}
+
+function parseCookieHeader(cookieHeader) {
+  const out = {};
+  if (!cookieHeader || typeof cookieHeader !== 'string') return out;
+
+  for (const part of cookieHeader.split(';')) {
+    const trimmed = String(part ?? '').trim();
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) continue;
+
+    const key = trimmed.slice(0, idx).trim();
+    const value = trimmed.slice(idx + 1).trim();
+    if (!key || !value) continue;
+
+    out[key] = value;
+  }
+
+  return out;
+}
+
+function cookieHeaderFromCookies(cookies) {
+  const entries = Object.entries(cookies ?? {})
+    .map(([rawKey, rawValue]) => [String(rawKey ?? '').trim(), String(rawValue ?? '').trim()])
+    .filter(([key, value]) => key && value);
+
+  if (!entries.length) return '';
+  return entries.map(([key, value]) => `${key}=${value}`).join('; ');
+}
+
+function getMapValueIgnoreCase(input, candidates) {
+  if (!input || typeof input !== 'object') return '';
+
+  const names = Array.isArray(candidates) ? candidates : [candidates];
+  const normalizedNames = names
+    .map((name) => String(name ?? '').trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!normalizedNames.length) return '';
+
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = String(rawKey ?? '').trim().toLowerCase();
+    if (!normalizedNames.includes(key)) continue;
+
+    const value = String(rawValue ?? '').trim();
+    if (!value) continue;
+    return value;
+  }
+
+  return '';
+}
+
+function hasHeaderIgnoreCase(headers, headerName) {
+  const name = String(headerName ?? '').trim().toLowerCase();
+  if (!name) return false;
+
+  return Object.keys(headers ?? {}).some((key) => String(key ?? '').trim().toLowerCase() === name);
+}
+
+function setHeaderIfMissing(headers, headerName, value) {
+  const safeHeaderName = String(headerName ?? '').trim();
+  const safeValue = String(value ?? '').trim();
+
+  if (!safeHeaderName || !safeValue) return;
+  if (hasHeaderIgnoreCase(headers, safeHeaderName)) return;
+
+  headers[safeHeaderName] = safeValue;
+}
+
+function toBearerToken(token) {
+  const value = String(token ?? '').trim();
+  if (!value) return '';
+  if (value.toLowerCase().startsWith('bearer ')) return value;
+  return `Bearer ${value}`;
+}
+
+function hydrateSessionHeadersFromCookies(headers, cookies, platform = null) {
+  const accessToken = getMapValueIgnoreCase(cookies, ['accessToken', 'gr_1_accessToken', 'auth_token', 'token']);
+  const xsrfToken = getMapValueIgnoreCase(cookies, ['XSRF-TOKEN', 'xsrfToken']);
+
+  setHeaderIfMissing(headers, 'Authorization', toBearerToken(accessToken));
+  setHeaderIfMissing(headers, 'x-access-token', accessToken);
+  setHeaderIfMissing(headers, 'x-device-id', getMapValueIgnoreCase(cookies, ['device_id', 'gr_1_deviceId', 'gr_1_device_id', '_device_id', 'deviceId']));
+  setHeaderIfMissing(headers, 'x-session-id', getMapValueIgnoreCase(cookies, ['session_id', 'gr_1_session_id', 'gr_1_sessionId', '_session_tid', 'session_count']));
+  setHeaderIfMissing(headers, 'x-unique-browser-id', getMapValueIgnoreCase(cookies, ['unique_browser_id', 'gr_1_unique_browser_id', 'gr_1_uniqueBrowserId', '_swuid']));
+  setHeaderIfMissing(headers, 'x-xsrf-token', xsrfToken);
+  setHeaderIfMissing(headers, 'x-csrf-token', xsrfToken);
+
+  if (platform === PLATFORM_ZEPTO) {
+    setHeaderIfMissing(headers, 'platform', 'WEB');
+    setHeaderIfMissing(headers, 'app-version', '1.0.0');
+    setHeaderIfMissing(headers, 'X-WITHOUT-BEARER', 'true');
+  }
+}
+
+function normalisePlatformSession(session, platform = null) {
+  const cookies = normaliseStringMap(session?.cookies);
+  const headers = normaliseStringMap(session?.headers);
+  const extra = normaliseStringMap(session?.extra);
+
+  if (Object.keys(cookies).length === 0) {
+    const cookieHeader = String(headers.Cookie ?? headers.cookie ?? '').trim();
+    if (cookieHeader) {
+      Object.assign(cookies, parseCookieHeader(cookieHeader));
+    }
+  }
+
+  hydrateSessionHeadersFromCookies(headers, cookies, platform);
+
+  const normalizedCookieHeader = cookieHeaderFromCookies(cookies);
+  if (normalizedCookieHeader) {
+    headers.Cookie = normalizedCookieHeader;
+  }
+
+  return {
+    cookies,
+    headers,
+    extra,
+  };
+}
+
+function getCookieHeaderFromSession(session, platform = null) {
+  const normalized = normalisePlatformSession(session, platform);
+  const fromCookies = cookieHeaderFromCookies(normalized.cookies);
+  if (fromCookies) return fromCookies;
+
+  const fromHeaders = String(normalized.headers.Cookie ?? normalized.headers.cookie ?? '').trim();
+  return fromHeaders;
 }
 
 async function loadDevStore() {
@@ -358,6 +510,286 @@ export async function storePlatformCookieSession({ userId, platform, cookieHeade
   throw vaultUnavailableError();
 }
 
+export async function storePlatformSession({ userId, platform, session, expiresAt = null }) {
+  assertSupportedPlatform(platform);
+
+  const normalizedSession = normalisePlatformSession(session, platform);
+  const cookieHeader = getCookieHeaderFromSession(normalizedSession, platform);
+  if (!cookieHeader || !cookieHeader.includes('=')) {
+    throw new Error('session cookies are required and appear invalid');
+  }
+
+  const encryptedSession = encryptSecret(JSON.stringify(normalizedSession));
+  const encryptedCookie = encryptSecret(cookieHeader);
+  const safeExpiresAt = normaliseExpiresAt(expiresAt);
+  const mode = getTokenVaultMode();
+
+  if (mode === 'postgres') {
+    return withTransaction(async (client) => {
+      await ensureUserDb(client, userId);
+
+      await client.query(
+        `INSERT INTO platform_connections (
+           user_id, platform, status, status_reason, connected_at, disconnected_at, last_validated_at, updated_at
+         ) VALUES ($1, $2, 'connected', NULL, NOW(), NULL, NOW(), NOW())
+         ON CONFLICT (user_id, platform)
+         DO UPDATE SET
+           status = 'connected',
+           status_reason = NULL,
+           connected_at = COALESCE(platform_connections.connected_at, NOW()),
+           disconnected_at = NULL,
+           last_validated_at = NOW(),
+           updated_at = NOW()`,
+        [userId, platform]
+      );
+
+      await client.query(
+        `INSERT INTO platform_tokens (
+           user_id, platform, token_type, encrypted_token, iv, auth_tag, key_version, expires_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (user_id, platform, token_type)
+         DO UPDATE SET
+           encrypted_token = EXCLUDED.encrypted_token,
+           iv = EXCLUDED.iv,
+           auth_tag = EXCLUDED.auth_tag,
+           key_version = EXCLUDED.key_version,
+           expires_at = EXCLUDED.expires_at,
+           updated_at = NOW()`,
+        [
+          userId,
+          platform,
+          TOKEN_TYPE_SESSION_JSON,
+          encryptedSession.encryptedToken,
+          encryptedSession.iv,
+          encryptedSession.authTag,
+          encryptedSession.keyVersion,
+          safeExpiresAt,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO platform_tokens (
+           user_id, platform, token_type, encrypted_token, iv, auth_tag, key_version, expires_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (user_id, platform, token_type)
+         DO UPDATE SET
+           encrypted_token = EXCLUDED.encrypted_token,
+           iv = EXCLUDED.iv,
+           auth_tag = EXCLUDED.auth_tag,
+           key_version = EXCLUDED.key_version,
+           expires_at = EXCLUDED.expires_at,
+           updated_at = NOW()`,
+        [
+          userId,
+          platform,
+          TOKEN_TYPE_COOKIE,
+          encryptedCookie.encryptedToken,
+          encryptedCookie.iv,
+          encryptedCookie.authTag,
+          encryptedCookie.keyVersion,
+          safeExpiresAt,
+        ]
+      );
+
+      await writeAuditDb(client, {
+        userId,
+        platform,
+        eventType: 'token_upsert',
+        metadata: {
+          tokenType: TOKEN_TYPE_SESSION_JSON,
+          keyVersion: encryptedSession.keyVersion,
+          hasExpiry: Boolean(safeExpiresAt),
+          hasCookieHeader: true,
+        },
+      });
+
+      return {
+        platform,
+        status: 'connected',
+        expiresAt: safeExpiresAt,
+        tokenType: TOKEN_TYPE_SESSION_JSON,
+      };
+    });
+  }
+
+  if (mode === 'dev-file') {
+    return withDevStore(async (store) => {
+      const user = ensureDevUserRecord(store, userId);
+      const current = user.connections[platform] ?? null;
+      const timestamp = nowIso();
+
+      user.connections[platform] = {
+        status: 'connected',
+        status_reason: null,
+        connected_at: current?.connected_at ?? timestamp,
+        disconnected_at: null,
+        last_validated_at: timestamp,
+        updated_at: timestamp,
+      };
+
+      if (!user.tokens[platform] || typeof user.tokens[platform] !== 'object') {
+        user.tokens[platform] = {};
+      }
+
+      user.tokens[platform][TOKEN_TYPE_SESSION_JSON] = {
+        encrypted_token: encryptedSession.encryptedToken,
+        iv: encryptedSession.iv,
+        auth_tag: encryptedSession.authTag,
+        key_version: encryptedSession.keyVersion,
+        expires_at: safeExpiresAt,
+        updated_at: timestamp,
+      };
+
+      user.tokens[platform][TOKEN_TYPE_COOKIE] = {
+        encrypted_token: encryptedCookie.encryptedToken,
+        iv: encryptedCookie.iv,
+        auth_tag: encryptedCookie.authTag,
+        key_version: encryptedCookie.keyVersion,
+        expires_at: safeExpiresAt,
+        updated_at: timestamp,
+      };
+
+      pushDevAudit(user, {
+        platform,
+        eventType: 'token_upsert',
+        metadata: {
+          tokenType: TOKEN_TYPE_SESSION_JSON,
+          keyVersion: encryptedSession.keyVersion,
+          hasExpiry: Boolean(safeExpiresAt),
+          hasCookieHeader: true,
+          mode: 'dev-file',
+        },
+      });
+
+      return {
+        platform,
+        status: 'connected',
+        expiresAt: safeExpiresAt,
+        tokenType: TOKEN_TYPE_SESSION_JSON,
+      };
+    });
+  }
+
+  throw vaultUnavailableError();
+}
+
+export async function getPlatformSession(userId, platform) {
+  assertSupportedPlatform(platform);
+  const mode = getTokenVaultMode();
+
+  if (mode === 'postgres') {
+    const { rows } = await query(
+      `SELECT encrypted_token, iv, auth_tag, key_version, expires_at
+       FROM platform_tokens
+       WHERE user_id = $1 AND platform = $2 AND token_type = $3
+       LIMIT 1`,
+      [userId, platform, TOKEN_TYPE_SESSION_JSON]
+    );
+
+    if (rows[0]) {
+      const row = rows[0];
+      const decrypted = decryptSecret({
+        encryptedToken: row.encrypted_token,
+        iv: row.iv,
+        authTag: row.auth_tag,
+      });
+
+      const parsed = JSON.parse(decrypted);
+      const normalized = normalisePlatformSession(parsed, platform);
+
+      return {
+        ...normalized,
+        expiresAt: row.expires_at ?? null,
+        keyVersion: row.key_version ?? 1,
+      };
+    }
+
+    const { rows: cookieRows } = await query(
+      `SELECT encrypted_token, iv, auth_tag, key_version, expires_at
+       FROM platform_tokens
+       WHERE user_id = $1 AND platform = $2 AND token_type = $3
+       LIMIT 1`,
+      [userId, platform, TOKEN_TYPE_COOKIE]
+    );
+
+    if (!cookieRows[0]) {
+      return null;
+    }
+
+    const row = cookieRows[0];
+    const cookieHeader = decryptSecret({
+      encryptedToken: row.encrypted_token,
+      iv: row.iv,
+      authTag: row.auth_tag,
+    });
+
+    const normalized = normalisePlatformSession(
+      {
+        cookies: parseCookieHeader(cookieHeader),
+        headers: cookieHeader ? { Cookie: cookieHeader } : {},
+        extra: {},
+      },
+      platform
+    );
+
+    return {
+      ...normalized,
+      expiresAt: row.expires_at ?? null,
+      keyVersion: row.key_version ?? 1,
+    };
+  }
+
+  if (mode === 'dev-file') {
+    const store = await loadDevStore();
+    const sessionToken = store.users[userId]?.tokens?.[platform]?.[TOKEN_TYPE_SESSION_JSON] ?? null;
+
+    if (sessionToken) {
+      const decrypted = decryptSecret({
+        encryptedToken: sessionToken.encrypted_token,
+        iv: sessionToken.iv,
+        authTag: sessionToken.auth_tag,
+      });
+
+      const parsed = JSON.parse(decrypted);
+      const normalized = normalisePlatformSession(parsed, platform);
+
+      return {
+        ...normalized,
+        expiresAt: sessionToken.expires_at ?? null,
+        keyVersion: sessionToken.key_version ?? 1,
+      };
+    }
+
+    const cookieToken = store.users[userId]?.tokens?.[platform]?.[TOKEN_TYPE_COOKIE] ?? null;
+    if (!cookieToken) {
+      return null;
+    }
+
+    const cookieHeader = decryptSecret({
+      encryptedToken: cookieToken.encrypted_token,
+      iv: cookieToken.iv,
+      authTag: cookieToken.auth_tag,
+    });
+
+    const normalized = normalisePlatformSession(
+      {
+        cookies: parseCookieHeader(cookieHeader),
+        headers: cookieHeader ? { Cookie: cookieHeader } : {},
+        extra: {},
+      },
+      platform
+    );
+
+    return {
+      ...normalized,
+      expiresAt: cookieToken.expires_at ?? null,
+      keyVersion: cookieToken.key_version ?? 1,
+    };
+  }
+
+  throw vaultUnavailableError();
+}
+
 export async function getPlatformCookieSession(userId, platform) {
   assertSupportedPlatform(platform);
   const mode = getTokenVaultMode();
@@ -371,7 +803,19 @@ export async function getPlatformCookieSession(userId, platform) {
       [userId, platform, TOKEN_TYPE_COOKIE]
     );
 
-    if (!rows[0]) return null;
+    if (!rows[0]) {
+      const session = await getPlatformSession(userId, platform);
+      if (!session) return null;
+
+      const cookieHeader = getCookieHeaderFromSession(session, platform);
+      if (!cookieHeader) return null;
+
+      return {
+        cookieHeader,
+        expiresAt: session.expiresAt ?? null,
+        keyVersion: session.keyVersion ?? 1,
+      };
+    }
 
     const row = rows[0];
     const cookieHeader = decryptSecret({
@@ -390,7 +834,19 @@ export async function getPlatformCookieSession(userId, platform) {
   if (mode === 'dev-file') {
     const store = await loadDevStore();
     const token = store.users[userId]?.tokens?.[platform]?.[TOKEN_TYPE_COOKIE] ?? null;
-    if (!token) return null;
+    if (!token) {
+      const session = await getPlatformSession(userId, platform);
+      if (!session) return null;
+
+      const cookieHeader = getCookieHeaderFromSession(session, platform);
+      if (!cookieHeader) return null;
+
+      return {
+        cookieHeader,
+        expiresAt: session.expiresAt ?? null,
+        keyVersion: session.keyVersion ?? 1,
+      };
+    }
 
     const cookieHeader = decryptSecret({
       encryptedToken: token.encrypted_token,
@@ -501,13 +957,14 @@ export async function disconnectPlatform(userId, platform, disconnectReason = 'u
   }
 
   if (mode === 'dev-file') {
-    return withDevStore(async (store) => {
+    await withDevStore(async (store) => {
       const user = ensureDevUserRecord(store, userId);
       const current = user.connections[platform] ?? null;
       const timestamp = nowIso();
 
       if (user.tokens[platform]) {
         delete user.tokens[platform][TOKEN_TYPE_COOKIE];
+        delete user.tokens[platform][TOKEN_TYPE_SESSION_JSON];
       }
 
       user.connections[platform] = {
@@ -525,6 +982,7 @@ export async function disconnectPlatform(userId, platform, disconnectReason = 'u
         metadata: { actor: 'user', reason: disconnectReason, mode: 'dev-file' },
       });
     });
+    return;
   }
 
   throw vaultUnavailableError();
